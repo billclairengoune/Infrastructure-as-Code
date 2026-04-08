@@ -1,0 +1,401 @@
+---
+# -------------------------------------------------------------
+#              Durcissement Système
+# -------------------------------------------------------------
+
+- hosts: all
+  become: true
+
+  vars:
+    ufw_public_tcp_ports:
+      - 22
+      - 443
+    fail2ban_package_name: fail2ban
+    fail2ban_service_name: fail2ban
+    fail2ban_ignoreip:
+      - 127.0.0.1/8
+      - ::1
+    fail2ban_bantime: "1h"
+    fail2ban_findtime: "10m"
+    fail2ban_maxretry: 5
+    tailscale_auth_key: "tskey-xxxxxxxxxxxxxxxx"
+
+    # Clé publique du poste de contrôle (WSL/Linux)
+    controller_ssh_public_key: "{{ lookup('file', lookup('env', 'HOME') + '/.ssh/id_ed25519.pub') }}"
+
+  tasks:
+    # ---------------Installation de Sudo et ajout de l'utilisateur dans le groupe sudo ------
+
+    - name: Installer sudo
+      ansible.builtin.apt:
+        name: sudo
+        state: present
+        update_cache: yes
+
+    - name: Debug Installer sudo
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Ajouter l'utilisateur courant au groupe sudo
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: sudo
+        append: yes
+
+    - name: Debug Ajouter l'utilisateur courant au groupe sudo
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # --------------Installation du service ssh---------------
+
+    - name: Installer openssh-server
+      ansible.builtin.apt:
+        name: openssh-server
+        state: present
+
+    - name: Debug Installer openssh-server
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Activer et démarrer le service ssh
+      ansible.builtin.service:
+        name: ssh
+        enabled: true
+        state: started
+
+    - name: Debug Activer et démarrer le service ssh
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # ---------Mise en place de l'accès SSH par clé avant de couper le mot de passe-------------
+
+    - name: Créer le répertoire .ssh pour l'utilisateur distant
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0700"
+
+    - name: Debug Créer le répertoire .ssh pour l'utilisateur distant
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Déployer la clé publique du contrôleur dans authorized_keys
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ controller_ssh_public_key }}"
+
+    - name: Debug Déployer la clé publique du contrôleur dans authorized_keys
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Activer l'authentification par clé publique
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*#?\s*PubkeyAuthentication\s+'
+        line: 'PubkeyAuthentication yes'
+        backup: true
+
+    - name: Debug Activer l'authentification par clé publique
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Conserver temporairement l'authentification SSH par mot de passe
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PasswordAuthentication\s'
+        line: 'PasswordAuthentication yes'
+        state: present
+        backup: true
+
+    - name: Debug Conserver temporairement l'authentification SSH par mot de passe
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Restart SSH après mise en place de la clé
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Debug Restart SSH après mise en place de la clé
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Réinitialiser la connexion SSH pour forcer Ansible à se reconnecter
+      ansible.builtin.meta: reset_connection
+
+    - name: Vérifier que la machine reste joignable après bascule sur la clé
+      ansible.builtin.wait_for_connection:
+        timeout: 30
+
+    - name: Debug Vérifier que la machine reste joignable après bascule sur la clé
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # ------------ Mise à jour complète du système ---------------
+
+    - name: Update package cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Debug Update package cache
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Upgrade packages
+      ansible.builtin.apt:
+        upgrade: dist
+
+    - name: Debug Upgrade packages
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Remove unused packages
+      ansible.builtin.apt:
+        autoremove: yes
+        purge: yes
+
+    - name: Debug Remove unused packages
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # ---------Désactivation de la connexion ssh root-------------
+
+    - name: Disable ssh root login
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*#?\s*PermitRootLogin\s+'
+        line: 'PermitRootLogin no'
+        backup: true
+
+    - name: Debug Disable ssh root login
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Restart SSH
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Debug Restart SSH
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # ---------Désactivation de l'authentification SSH par mot de passe--------
+
+    - name: Disable SSH password authentication
+      ansible.builtin.lineinfile:
+        dest: /etc/ssh/sshd_config
+        regexp: '^#?\s*PasswordAuthentication\s'
+        line: 'PasswordAuthentication no'
+        state: present
+        backup: true
+
+    - name: Debug Disable SSH password authentication
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Restart SSH after password auth change
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Debug Restart SSH after password auth change
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Réinitialiser la connexion après désactivation du mot de passe
+      ansible.builtin.meta: reset_connection
+
+    - name: Vérifier que la connexion SSH fonctionne toujours après désactivation du mot de passe
+      ansible.builtin.wait_for_connection:
+        timeout: 30
+
+    - name: Debug Vérifier que la connexion SSH fonctionne toujours après désactivation du mot de passe
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # ----------Configuration UFW : règles minimales justifiées----------------
+
+    - name: Installer UFW
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+
+    - name: Déployer une configuration sysctl propre pour UFW
+      ansible.builtin.copy:
+        dest: /etc/ufw/sysctl.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Configuration sysctl utilisée par UFW
+          net.ipv4.ip_forward=1
+          net.ipv4.conf.default.rp_filter=1
+          net.ipv4.conf.all.rp_filter=1
+          net.ipv4.tcp_syncookies=1
+          net.ipv6.conf.default.accept_redirects=0
+          net.ipv6.conf.all.accept_redirects=0
+          net.ipv4.conf.default.accept_redirects=0
+          net.ipv4.conf.all.accept_redirects=0
+          net.ipv4.icmp_echo_ignore_broadcasts=1
+          net.ipv4.icmp_ignore_bogus_error_responses=1
+          net.ipv4.tcp_timestamps=0
+
+    - name: Refuser tout le trafic entrant par défaut
+      community.general.ufw:
+        direction: incoming
+        default: deny
+
+    - name: Autoriser tout le trafic sortant par défaut
+      community.general.ufw:
+        direction: outgoing
+        default: allow
+
+    - name: Autoriser SSH
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: Activer UFW
+      community.general.ufw:
+        state: enabled
+
+    # ------------------Installation et configuration de fail2ban-------------------------
+
+    - name: Installer Fail2ban
+      ansible.builtin.package:
+        name: "{{ fail2ban_package_name }}"
+        state: present
+
+    - name: Debug Installer Fail2ban
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Créer le répertoire de configuration locale Fail2ban
+      ansible.builtin.file:
+        path: /etc/fail2ban/jail.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Debug Créer le répertoire de configuration locale Fail2ban
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Configurer la jail SSH
+      ansible.builtin.copy:
+        dest: /etc/fail2ban/jail.d/sshd.local
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [DEFAULT]
+          ignoreip = {{ fail2ban_ignoreip | join(' ') }}
+          bantime  = {{ fail2ban_bantime }}
+          findtime = {{ fail2ban_findtime }}
+          maxretry = {{ fail2ban_maxretry }}
+
+          [sshd]
+          enabled = true
+          port    = ssh
+      notify: Redémarrer Fail2ban
+
+    - name: Debug Configurer la jail SSH
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Activer et démarrer Fail2ban
+      ansible.builtin.service:
+        name: "{{ fail2ban_service_name }}"
+        enabled: true
+        state: started
+
+    - name: Debug Activer et démarrer Fail2ban
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Afficher la configuration choisie
+      ansible.builtin.debug:
+        msg:
+          - "Fail2ban installé et activé"
+          - "Protection SSH activée"
+          - "ignoreip = {{ fail2ban_ignoreip | join(' ') }}"
+          - "bantime = {{ fail2ban_bantime }}"
+          - "findtime = {{ fail2ban_findtime }}"
+          - "maxretry = {{ fail2ban_maxretry }}"
+
+    - name: Debug Afficher la configuration choisie
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # ----------------------Installation et configuration de Tailscale-------------------------
+
+    - name: Télécharger le script d'installation Tailscale
+      ansible.builtin.get_url:
+        url: https://tailscale.com/install.sh
+        dest: /tmp/tailscale-install.sh
+        mode: "0755"
+
+    - name: Installer Tailscale
+      ansible.builtin.command:
+        cmd: sh /tmp/tailscale-install.sh
+
+    - name: Connecter la machine à Tailscale
+      ansible.builtin.command:
+        cmd: tailscale up --auth-key={{ tailscale_auth_key }}
+      no_log: true
+
+    - name: Vérifier le statut Tailscale
+      ansible.builtin.command:
+        cmd: tailscale status
+      register: tailscale_status
+      changed_when: false
+
+    - name: Afficher le statut Tailscale
+      ansible.builtin.debug:
+        var: tailscale_status.stdout_lines
+
+    # --------------------------Activation des mises à jour automatiques de sécurité-------------------------------
+
+    - name: Installer unattended-upgrades
+      ansible.builtin.apt:
+        name: unattended-upgrades
+        state: present
+        update_cache: yes
+
+    - name: Activer les mises à jour automatiques
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Autoriser uniquement les mises à jour de sécurité
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        content: |
+          Unattended-Upgrade::Origins-Pattern {
+              "origin=Debian,codename=${distro_codename},label=Debian-Security";
+          };
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Afficher OK
+      ansible.builtin.debug:
+        msg: "OK"
+
+  handlers:
+    - name: Redémarrer Fail2ban
+      ansible.builtin.service:
+        name: "{{ fail2ban_service_name }}"
+        state: restarted

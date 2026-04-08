@@ -1,0 +1,140 @@
+---
+- name: Audit sécurité Debian avec Lynis et OpenSCAP
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    audit_dir: /var/log/security-audit
+    local_reports_dir: "{{ lookup('env', 'HOME') }}/reports/{{ inventory_hostname }}"
+    debian_release: "{{ ansible_distribution_release }}"
+    oval_bz2: "{{ audit_dir }}/oval-definitions-{{ debian_release }}.xml.bz2"
+    oval_xml: "{{ audit_dir }}/oval-definitions-{{ debian_release }}.xml"
+    oval_url: "https://www.debian.org/security/oval/oval-definitions-{{ debian_release }}.xml.bz2"
+
+  tasks:
+    - name: Vérifier que la cible est Debian
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Debian"
+        fail_msg: "Ce playbook est prévu pour Debian."
+        success_msg: "Debian détecté."
+
+    - name: Créer le répertoire d'audit sur la machine cible
+      ansible.builtin.file:
+        path: "{{ audit_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Installer les outils d'audit
+      ansible.builtin.apt:
+        name:
+          - lynis
+          - openscap-scanner
+          - bzip2
+        state: present
+        update_cache: true
+
+    - name: Télécharger les définitions OVAL Debian
+      ansible.builtin.get_url:
+        url: "{{ oval_url }}"
+        dest: "{{ oval_bz2 }}"
+        mode: "0644"
+        force: false
+
+    - name: Décompresser les définitions OVAL Debian
+      ansible.builtin.shell: >
+        bzip2 -dc {{ oval_bz2 }} > {{ oval_xml }}
+      args:
+        creates: "{{ oval_xml }}"
+      changed_when: false
+
+    - name: Trouver le binaire Lynis
+      ansible.builtin.shell: |
+        if command -v lynis >/dev/null 2>&1; then
+          command -v lynis
+        elif [ -x /usr/sbin/lynis ]; then
+          echo /usr/sbin/lynis
+        elif [ -x /usr/bin/lynis ]; then
+          echo /usr/bin/lynis
+        elif [ -x /bin/lynis ]; then
+          echo /bin/lynis
+        else
+          exit 1
+        fi
+      register: lynis_bin
+      changed_when: false
+      failed_when: lynis_bin.rc != 0
+
+    - name: Afficher le chemin du binaire Lynis
+      ansible.builtin.debug:
+        msg: "Binaire Lynis trouvé : {{ lynis_bin.stdout | trim }}"
+
+    - name: Lancer Lynis
+      ansible.builtin.command:
+        cmd: >
+          {{ lynis_bin.stdout | trim }} audit system
+          --quiet
+          --logfile {{ audit_dir }}/lynis.log
+          --report-file {{ audit_dir }}/lynis-report.dat
+      register: lynis_audit
+      changed_when: false
+
+    - name: Lancer OpenSCAP avec les définitions OVAL Debian
+      ansible.builtin.command:
+        cmd: >
+          oscap oval eval
+          --results {{ audit_dir }}/openscap-results.xml
+          --report {{ audit_dir }}/openscap-report.html
+          {{ oval_xml }}
+      register: oscap_result
+      changed_when: false
+      failed_when: oscap_result.rc == 1
+
+    - name: Extraire le score Lynis
+      ansible.builtin.shell: |
+        awk -F= '/^hardening_index=/{print $2}' {{ audit_dir }}/lynis-report.dat
+      register: lynis_score
+      changed_when: false
+      failed_when: false
+
+    - name: Créer le dossier local de récupération
+      ansible.builtin.file:
+        path: "{{ local_reports_dir }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+
+    - name: Récupérer le log Lynis
+      ansible.builtin.fetch:
+        src: "{{ audit_dir }}/lynis.log"
+        dest: "{{ local_reports_dir }}/lynis.log"
+        flat: true
+
+    - name: Récupérer le rapport Lynis
+      ansible.builtin.fetch:
+        src: "{{ audit_dir }}/lynis-report.dat"
+        dest: "{{ local_reports_dir }}/lynis-report.dat"
+        flat: true
+
+    - name: Récupérer le rapport HTML OpenSCAP
+      ansible.builtin.fetch:
+        src: "{{ audit_dir }}/openscap-report.html"
+        dest: "{{ local_reports_dir }}/openscap-report.html"
+        flat: true
+
+    - name: Récupérer le résultat XML OpenSCAP
+      ansible.builtin.fetch:
+        src: "{{ audit_dir }}/openscap-results.xml"
+        dest: "{{ local_reports_dir }}/openscap-results.xml"
+        flat: true
+
+    - name: Afficher le résumé
+      ansible.builtin.debug:
+        msg:
+          - "Audit terminé pour {{ inventory_hostname }}"
+          - "Score Lynis : {{ lynis_score.stdout | default('indisponible') }}"
+          - "Rapports récupérés dans : {{ local_reports_dir }}"
