@@ -20,8 +20,11 @@
     fail2ban_maxretry: 5
     tailscale_auth_key: "tskey-xxxxxxxxxxxxxxxx"
 
+    # Clé publique du poste de contrôle (WSL/Linux)
+    controller_ssh_public_key: "{{ lookup('file', lookup('env', 'HOME') + '/.ssh/id_ed25519.pub') }}"
+
   tasks:
-    # ---------------Installation de Sudo et ajout de l'utilisateur dans le group sudo ------
+    # ---------------Installation de Sudo et ajout de l'utilisateur dans le groupe sudo ------
 
     - name: Installer sudo
       ansible.builtin.apt:
@@ -35,7 +38,7 @@
 
     - name: Ajouter l'utilisateur courant au groupe sudo
       ansible.builtin.user:
-        name: "{{ lookup('env', 'SUDO_USER') | default(lookup('env', 'USER'), true) }}"
+        name: "{{ ansible_user }}"
         groups: sudo
         append: yes
 
@@ -61,6 +64,73 @@
         state: started
 
     - name: Debug Activer et démarrer le service ssh
+      ansible.builtin.debug:
+        msg: "OK"
+
+    # ---------Mise en place de l'accès SSH par clé avant de couper le mot de passe-------------
+
+    - name: Créer le répertoire .ssh pour l'utilisateur distant
+      ansible.builtin.file:
+        path: "/home/{{ ansible_user }}/.ssh"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0700"
+
+    - name: Debug Créer le répertoire .ssh pour l'utilisateur distant
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Déployer la clé publique du contrôleur dans authorized_keys
+      ansible.posix.authorized_key:
+        user: "{{ ansible_user }}"
+        state: present
+        key: "{{ controller_ssh_public_key }}"
+
+    - name: Debug Déployer la clé publique du contrôleur dans authorized_keys
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Activer l'authentification par clé publique
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^\s*#?\s*PubkeyAuthentication\s+'
+        line: 'PubkeyAuthentication yes'
+        backup: true
+
+    - name: Debug Activer l'authentification par clé publique
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Conserver temporairement l'authentification SSH par mot de passe
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?\s*PasswordAuthentication\s'
+        line: 'PasswordAuthentication yes'
+        state: present
+        backup: true
+
+    - name: Debug Conserver temporairement l'authentification SSH par mot de passe
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Restart SSH après mise en place de la clé
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Debug Restart SSH après mise en place de la clé
+      ansible.builtin.debug:
+        msg: "OK"
+
+    - name: Réinitialiser la connexion SSH pour forcer Ansible à se reconnecter
+      ansible.builtin.meta: reset_connection
+
+    - name: Vérifier que la machine reste joignable après bascule sur la clé
+      ansible.builtin.wait_for_connection:
+        timeout: 30
+
+    - name: Debug Vérifier que la machine reste joignable après bascule sur la clé
       ansible.builtin.debug:
         msg: "OK"
 
@@ -121,6 +191,7 @@
         regexp: '^#?\s*PasswordAuthentication\s'
         line: 'PasswordAuthentication no'
         state: present
+        backup: true
 
     - name: Debug Disable SSH password authentication
       ansible.builtin.debug:
@@ -135,85 +206,66 @@
       ansible.builtin.debug:
         msg: "OK"
 
-    # ----------Configuration UFW : règles minimales justifiées----------------
+    - name: Réinitialiser la connexion après désactivation du mot de passe
+      ansible.builtin.meta: reset_connection
 
-    # Vérifier que UFW est installé
+    - name: Vérifier que la connexion SSH fonctionne toujours après désactivation du mot de passe
+      ansible.builtin.wait_for_connection:
+        timeout: 30
 
-    - name: Ensure UFW is installed
-      ansible.builtin.package:
-        name: ufw
-        state: present
-
-    - name: Debug Ensure UFW is installed
+    - name: Debug Vérifier que la connexion SSH fonctionne toujours après désactivation du mot de passe
       ansible.builtin.debug:
         msg: "OK"
 
-    # Interdire le trafic entrant
+    # ----------Configuration UFW : règles minimales justifiées----------------
 
-    - name: Default deny all incoming traffic
+    - name: Installer UFW
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: true
+
+    - name: Déployer une configuration sysctl propre pour UFW
+      ansible.builtin.copy:
+        dest: /etc/ufw/sysctl.conf
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Configuration sysctl utilisée par UFW
+          net.ipv4.ip_forward=1
+          net.ipv4.conf.default.rp_filter=1
+          net.ipv4.conf.all.rp_filter=1
+          net.ipv4.tcp_syncookies=1
+          net.ipv6.conf.default.accept_redirects=0
+          net.ipv6.conf.all.accept_redirects=0
+          net.ipv4.conf.default.accept_redirects=0
+          net.ipv4.conf.all.accept_redirects=0
+          net.ipv4.icmp_echo_ignore_broadcasts=1
+          net.ipv4.icmp_ignore_bogus_error_responses=1
+          net.ipv4.tcp_timestamps=0
+
+    - name: Refuser tout le trafic entrant par défaut
       community.general.ufw:
         direction: incoming
         default: deny
 
-    - name: Debug Default deny all incoming traffic
-      ansible.builtin.debug:
-        msg: "OK"
-
-    # Autoriser le trafic sortant
-
-    - name: Default allow all outgoing traffic
+    - name: Autoriser tout le trafic sortant par défaut
       community.general.ufw:
         direction: outgoing
         default: allow
 
-    - name: Debug Default allow all outgoing traffic
-      ansible.builtin.debug:
-        msg: "OK"
-
-    # Autoriser la connexion ssh
-
-    - name: Allow openssh
+    - name: Autoriser SSH
       community.general.ufw:
         rule: allow
-        name: OpenSSH
-
-    - name: Debug Allow openssh
-      ansible.builtin.debug:
-        msg: "OK"
-
-    # Autoriser les ports TCP nécessaires
-
-    - name: Allow required public TCP ports
-      community.general.ufw:
-        rule: allow
+        port: "22"
         proto: tcp
-        to_port: "{{ item }}"
-        comment: "Public service port"
-      loop: "{{ ufw_public_tcp_ports }}"
 
-    - name: Debug Allow required public TCP ports
-      ansible.builtin.debug:
-        msg: "OK"
-
-    - name: Set low logging
-      community.general.ufw:
-        logging: low
-
-    - name: Debug Set low logging
-      ansible.builtin.debug:
-        msg: "OK"
-
-    # Activer UFW
-
-    - name: Enable UFW
+    - name: Activer UFW
       community.general.ufw:
         state: enabled
 
-    - name: Debug Enable UFW
-      ansible.builtin.debug:
-        msg: "OK"
-
-    # ------------------Installation et configuration de fail2ban (protection SSH, seuils à définir)-------------------------
+    # ------------------Installation et configuration de fail2ban-------------------------
 
     - name: Installer Fail2ban
       ansible.builtin.package:
@@ -309,7 +361,7 @@
       ansible.builtin.debug:
         var: tailscale_status.stdout_lines
 
-    # --------------------------Activation des mises à jour automatiques de sécurité (unattended-upgrades)-------------------------------
+    # --------------------------Activation des mises à jour automatiques de sécurité-------------------------------
 
     - name: Installer unattended-upgrades
       ansible.builtin.apt:
@@ -341,51 +393,6 @@
     - name: Afficher OK
       ansible.builtin.debug:
         msg: "OK"
-
-    # --------------------------Audit avec Lynis et OpenSCAP-----------------------------------
-
-    # Installation de Lynis et OpenSCAP
-
-    - name: Installer Lynis et OpenSCAP
-      ansible.builtin.apt:
-        name:
-          - lynis
-          - openscap-scanner
-        state: present
-
-    # Audit avec Lynis
-
-    - name: Créer un dossier pour les rapports
-      ansible.builtin.file:
-        path: /var/log/audit
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Lancer Lynis et générer un rapport
-      ansible.builtin.command: lynis audit system --quiet
-      register: lynis_result
-      changed_when: false
-
-    - name: Sauvegarder la sortie Lynis
-      ansible.builtin.copy:
-        content: "{{ lynis_result.stdout }}"
-        dest: /var/log/audit/lynis-report.txt
-        owner: root
-        group: root
-        mode: "0644"
-
-    # Audit avec OpenSCAP
-
-    - name: Lancer un audit OpenSCAP
-      ansible.builtin.command: >
-        oscap xccdf eval
-        --profile xccdf_org.ssgproject.content_profile_standard
-        --results /var/log/audit/openscap-results.xml
-        --report /var/log/audit/openscap-report.html
-        /usr/share/xml/scap/ssg/content/ssg-debian12-ds.xml
-      changed_when: false
 
   handlers:
     - name: Redémarrer Fail2ban
